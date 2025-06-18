@@ -9,7 +9,7 @@ from PIL import Image
 BACKGROUND_DIR = "./BackgroundImages"
 CARD_DIR = "./images"
 EFFECTS_DIR = "./Effects"
-
+NUM_IMAGES = 10000
 
 # Output directories
 BASE_DIR = "./SegmentationTraining"
@@ -34,25 +34,60 @@ for split in OUTPUT_DIRS.values():
 def load_images_from_folder(folder, valid_exts=('.png', '.jpg', '.jpeg')):
     return [os.path.join(folder, f) for f in os.listdir(folder) if f.lower().endswith(valid_exts)]
 
-def random_transform(card_img, output_size=(480, 640)):
+def random_transform(card_img, num_cards, output_size=(480, 640)):
     h, w = card_img.shape[:2]
     src_pts = np.array([[0, 0], [w, 0], [w, h], [0, h]], dtype=np.float32)
 
+    # Apply random perspective skew
     max_skew = 20
     dst_pts = src_pts + np.random.uniform(-max_skew, max_skew, src_pts.shape).astype(np.float32)
 
+    # ---- RANDOM SCALING ----
+    if num_cards == 1:
+        scale = np.random.uniform(0.6, 1.2)
+    else:
+        scale = np.random.uniform(0.4, 0.8)
+
+    # Scale relative to the center of the transformed card
+    center = dst_pts.mean(axis=0)
+    dst_pts = (dst_pts - center) * scale + center
+
+    # Compute width/height of the transformed card
     card_width = dst_pts[:, 0].max() - dst_pts[:, 0].min()
     card_height = dst_pts[:, 1].max() - dst_pts[:, 1].min()
 
-    # Mostly center, occasionally near corners
-    center_bias = np.random.beta(5, 2)
-    dx = int((output_size[0] - card_width) * center_bias)
-    dy = int((output_size[1] - card_height) * center_bias)
+    # ---- RANDOM ROTATION (in-plane) ----
+    angle_deg = random.uniform(0, 360)
+    angle_rad = np.deg2rad(angle_deg)
+
+    # Rotation matrix around the center of the transformed card
+    center_x = dst_pts[:, 0].mean()
+    center_y = dst_pts[:, 1].mean()
+    rotation_matrix = np.array([
+        [np.cos(angle_rad), -np.sin(angle_rad)],
+        [np.sin(angle_rad),  np.cos(angle_rad)]
+    ], dtype=np.float32)
+
+    dst_pts_centered = dst_pts - [center_x, center_y]
+    dst_pts_rotated = np.dot(dst_pts_centered, rotation_matrix.T) + [center_x, center_y]
+
+    dst_pts = dst_pts_rotated
+
+    # ---- RANDOM TRANSLATION ----
+    # More uniform randomness across the output image
+    max_dx = max(0, output_size[0] - card_width)
+    max_dy = max(0, output_size[1] - card_height)
+
+    dx = np.random.uniform(0, max_dx)
+    dy = np.random.uniform(0, max_dy)
     translation = np.array([[dx - dst_pts[:, 0].min(), dy - dst_pts[:, 1].min()]], dtype=np.float32)
+
     dst_pts += translation
 
+    # Final perspective transform
     M = cv2.getPerspectiveTransform(src_pts, dst_pts)
     return dst_pts.tolist(), M
+
 
 def apply_transform(card_img, M, size=(480, 640)):
     return cv2.warpPerspective(card_img, M, size, borderValue=(0, 0, 0, 0))
@@ -78,191 +113,303 @@ random.shuffle(indices)
 train_idx = indices[:int(0.8 * len(indices))]
 val_idx = indices[int(0.8 * len(indices)):]
 
-for i in range(4000):
+for i in range(int(NUM_IMAGES * .8)):
     bg_path = random.choice(backgrounds)
     bg = cv2.imread(bg_path)
     if bg is None:
         continue
-
     bg = cv2.resize(bg, (480, 640))
     canvas = bg.copy()
     mask_canvas = np.zeros((640, 480), dtype=np.uint8)
+    yolo_lines = []
+    existing_mask = np.zeros((640, 480), dtype=np.uint8)
+    num_cards = int(random.uniform(1, 5))
+    for x in range(num_cards):
+        card_path = random.choice(cards)
+        # Retry loop for invalid card images
+        while True:
+            card = cv2.imread(card_path, cv2.IMREAD_UNCHANGED)
+            if card is None or card.shape[2] != 4:
+                card_path = random.choice(cards)
+                continue
+            break
 
-    card_path = random.choice(cards)
-    # Retry loop for invalid card images
-    while True:
-        card = cv2.imread(card_path, cv2.IMREAD_UNCHANGED)
-        if card is None or card.shape[2] != 4:
-            card_path = random.choice(cards)
-            continue
-        break
+        card_rgb = card[:, :, :3]
+        card_mask = (card[:, :, 3] > 0).astype(np.uint8) * 255
 
-    card_rgb = card[:, :, :3]
-    card_mask = (card[:, :, 3] > 0).astype(np.uint8) * 255
+        while(True):
+            corners, M = random_transform(card, num_cards, output_size=(480, 640))
+            corners_np = np.array(corners, dtype=np.float32)
+            # Step 1: Warp the card's mask into the output canvas space
+            _, warped_card_mask = paste_card(np.zeros_like(canvas), card_rgb, card_mask, M)
 
-    corners, M = random_transform(card, output_size=(480, 640))
-    # 25% chance: Add a slightly larger sleeve using scaled corners
-    if random.random() < 0.25:
-        sleeve_color = tuple(np.random.randint(0, 255, size=3).tolist())
-        sleeve_shape = card_rgb.shape[:2]  # (height, width)
+            # Step 2: Check if it fits in bounds
+            if not (0 <= corners_np[:, 0]).all() or not (corners_np[:, 0] < 480).all():
+                continue
+            if not (0 <= corners_np[:, 1]).all() or not (corners_np[:, 1] < 640).all():
+                continue
 
-        sleeve_img = np.full((sleeve_shape[0], sleeve_shape[1], 3), sleeve_color, dtype=np.uint8)
-        sleeve_mask = np.full((sleeve_shape[0], sleeve_shape[1]), 255, dtype=np.uint8)
+            # Step 3: Check for overlap
+            overlap = cv2.bitwise_and(existing_mask, warped_card_mask)
+            if np.any(overlap):
+                continue  # This placement overlaps a previous card
 
-        # Scale corners outward from the center
+            # Step 4: Safe to paste
+            break
+
+        canvas, warped_card_mask = paste_card(canvas, card_rgb, card_mask, M)
+        existing_mask = cv2.bitwise_or(existing_mask, warped_card_mask)
+        # 25% chance: Add a slightly larger sleeve using scaled corners
+        if random.random() < 0.25:
+            sleeve_color = tuple(np.random.randint(0, 255, size=3).tolist())
+            sleeve_shape = card_rgb.shape[:2]  # (height, width)
+
+            sleeve_img = np.full((sleeve_shape[0], sleeve_shape[1], 3), sleeve_color, dtype=np.uint8)
+            sleeve_mask = np.full((sleeve_shape[0], sleeve_shape[1]), 255, dtype=np.uint8)
+
+            # Scale corners outward from the center
+            corners_np = np.array(corners, dtype=np.float32)
+            center = np.mean(corners_np, axis=0)
+            enlarged_corners = (corners_np - center) * 1.05 + center
+
+            src_pts = np.array([
+                [0, 0],
+                [sleeve_shape[1], 0],
+                [sleeve_shape[1], sleeve_shape[0]],
+                [0, sleeve_shape[0]]
+            ], dtype=np.float32)
+
+            sleeve_M = cv2.getPerspectiveTransform(src_pts, enlarged_corners)
+
+            canvas, _ = paste_card(canvas, sleeve_img, sleeve_mask, sleeve_M)
+        canvas, single_mask = paste_card(canvas, card_rgb, card_mask, M)
+        mask_canvas = cv2.bitwise_or(mask_canvas, single_mask)
+
+
+        # Add glare
+        if random.random() < 0.25:
+            # Load glare image
+            glare_img = Image.open(os.path.join(EFFECTS_DIR, "Glare/glare1.jpg")).convert("RGBA")
+
+            # Compute bounding box of the card
+            card_corners_np = np.array(corners, dtype=np.float32)
+            min_x = min(card_corners_np[:, 0])
+            max_x = max(card_corners_np[:, 0])
+            min_y = min(card_corners_np[:, 1])
+            max_y = max(card_corners_np[:, 1])
+            
+            card_w = max_x - min_x
+            card_h = max_y - min_y
+
+            # Choose random scale
+            scale = random.uniform(0.5, 0.9)
+            target_w = int(card_w * scale)
+            target_h = int(card_h * scale)
+
+            # Resize glare
+            glare_resized = glare_img.resize((target_w, target_h), resample=Image.Resampling.LANCZOS)
+
+            # Random rotation
+            angle = random.uniform(0, 360)
+            glare_rotated = glare_resized.rotate(angle, expand=True)
+
+            # Convert to OpenCV
+            glare_cv = cv2.cvtColor(np.array(glare_rotated), cv2.COLOR_RGBA2BGRA)
+
+            # Pick a random position inside card bounding box
+            top_left_x = int(min_x + (card_w - glare_cv.shape[1]) * random.uniform(0, 1))
+            top_left_y = int(min_y + (card_h - glare_cv.shape[0]) * random.uniform(0, 1))
+
+            # Create mask and paste using alpha blending
+            overlay = canvas.copy()
+            x1, y1 = top_left_x, top_left_y
+            x2, y2 = x1 + glare_cv.shape[1], y1 + glare_cv.shape[0]
+
+            # Ensure dimensions match
+            if x2 > overlay.shape[1] or y2 > overlay.shape[0] or x1 < 0 or y1 < 0 or x2 <= x1 or y2 <= y1:
+                continue  # skip if glare would go out of bounds
+
+            roi = overlay[y1:y2, x1:x2]
+            alpha = glare_cv[:, :, 3] / 255.0
+            for c in range(3):
+                roi[:, :, c] = roi[:, :, c] * (1 - alpha) + glare_cv[:, :, c] * alpha
+
+            overlay[y1:y2, x1:x2] = roi
+            canvas = overlay
+
+        # Normalize for YOLO: x1, y1, x2, y2, ...
+        height, width = 640, 480
         corners_np = np.array(corners, dtype=np.float32)
-        center = np.mean(corners_np, axis=0)
-        enlarged_corners = (corners_np - center) * 1.05 + center
 
-        src_pts = np.array([
-            [0, 0],
-            [sleeve_shape[1], 0],
-            [sleeve_shape[1], sleeve_shape[0]],
-            [0, sleeve_shape[0]]
-        ], dtype=np.float32)
+        # Flatten and normalize
+        norm_corners = []
+        for a, (b, c) in enumerate(corners_np):
+            x_norm = round(b / width, 6)
+            y_norm = round(c / height, 6)
+            norm_corners.extend([x_norm, y_norm])
 
-        sleeve_M = cv2.getPerspectiveTransform(src_pts, enlarged_corners)
-
-        canvas, _ = paste_card(canvas, sleeve_img, sleeve_mask, sleeve_M)
-    canvas, warped_mask = paste_card(canvas, card_rgb, card_mask, M)
-
-    # Add glare
-    if random.random() < 0.25:
-        # Load glare image
-        glare_img = Image.open(os.path.join(EFFECTS_DIR, "Glare/glare1.jpg")).convert("RGBA")
-
-        # Compute bounding box of the card
-        card_corners_np = np.array(corners, dtype=np.float32)
-        min_x = min(card_corners_np[:, 0])
-        max_x = max(card_corners_np[:, 0])
-        min_y = min(card_corners_np[:, 1])
-        max_y = max(card_corners_np[:, 1])
-        
-        card_w = max_x - min_x
-        card_h = max_y - min_y
-
-        # Choose random scale
-        scale = random.uniform(0.5, 0.9)
-        target_w = int(card_w * scale)
-        target_h = int(card_h * scale)
-
-        # Resize glare
-        glare_resized = glare_img.resize((target_w, target_h), resample=Image.Resampling.LANCZOS)
-
-        # Random rotation
-        angle = random.uniform(0, 360)
-        glare_rotated = glare_resized.rotate(angle, expand=True)
-
-        # Convert to OpenCV
-        glare_cv = cv2.cvtColor(np.array(glare_rotated), cv2.COLOR_RGBA2BGRA)
-
-        # Pick a random position inside card bounding box
-        top_left_x = int(min_x + (card_w - glare_cv.shape[1]) * random.uniform(0, 1))
-        top_left_y = int(min_y + (card_h - glare_cv.shape[0]) * random.uniform(0, 1))
-
-        # Create mask and paste using alpha blending
-        overlay = canvas.copy()
-        x1, y1 = top_left_x, top_left_y
-        x2, y2 = x1 + glare_cv.shape[1], y1 + glare_cv.shape[0]
-
-        # Ensure dimensions match
-        if x2 > overlay.shape[1] or y2 > overlay.shape[0]:
-            continue  # skip if glare would go out of bounds
-
-        roi = overlay[y1:y2, x1:x2]
-        alpha = glare_cv[:, :, 3] / 255.0
-        for c in range(3):
-            roi[:, :, c] = roi[:, :, c] * (1 - alpha) + glare_cv[:, :, c] * alpha
-
-        overlay[y1:y2, x1:x2] = roi
-        canvas = overlay
-
-    # Normalize for YOLO: x1, y1, x2, y2, ...
-    height, width = 640, 480
-    flat_corners = np.array(corners).reshape(-1)
-    norm_corners = [str(round(coord / width, 6) if i % 2 == 0 else round(coord / height, 6))
-                    for i, coord in enumerate(flat_corners)]
-    yolo_line = f"0 {' '.join(norm_corners)}\n"
+        # Format as YOLO segmentation line
+        yolo_line = f"0 {' '.join(map(str, norm_corners))}\n"
+        yolo_lines.append(yolo_line)
 
     # Save files
     base_name = f"synthetic_{i:04d}"
     cv2.imwrite(os.path.join(OUTPUT_DIRS["train"]["images"], f"{base_name}.jpg"), canvas)
-    cv2.imwrite(os.path.join(OUTPUT_DIRS["train"]["masks"], f"{base_name}.png"), warped_mask)
+    cv2.imwrite(os.path.join(OUTPUT_DIRS["train"]["masks"], f"{base_name}.png"), mask_canvas)
     with open(os.path.join(OUTPUT_DIRS["train"]["labels"], f"{base_name}.txt"), "w") as f:
-        f.write(yolo_line)
+        f.writelines(yolo_lines)
 
     if i % 100 == 0:
         print(f"Generated {i} samples...")
 
-# Generate 1000 validation images
-for i in range(4000, 5000):
-    # Create a background image for each validation sample
+# Generate validation images
+for i in range(int(NUM_IMAGES * .8), NUM_IMAGES):
     bg_path = random.choice(backgrounds)
     bg = cv2.imread(bg_path)
     if bg is None:
         continue
-
     bg = cv2.resize(bg, (480, 640))
     canvas = bg.copy()
     mask_canvas = np.zeros((640, 480), dtype=np.uint8)
+    yolo_lines = []
+    existing_mask = np.zeros((640, 480), dtype=np.uint8)
+    num_cards = int(random.uniform(1, 5))
+    for x in range(num_cards):
+        card_path = random.choice(cards)
+        # Retry loop for invalid card images
+        while True:
+            card = cv2.imread(card_path, cv2.IMREAD_UNCHANGED)
+            if card is None or card.shape[2] != 4:
+                card_path = random.choice(cards)
+                continue
+            break
 
-    # Select and process a card image
-    card_path = random.choice(cards)
+        card_rgb = card[:, :, :3]
+        card_mask = (card[:, :, 3] > 0).astype(np.uint8) * 255
 
-    # Retry loop for invalid card images
-    while True:
-        card = cv2.imread(card_path, cv2.IMREAD_UNCHANGED)
-        if card is None or card.shape[2] != 4:
-            print(f"Skipping invalid or non-RGBA image: {card_path}")
-            card_path = random.choice(cards)  # Choose another card
-            continue
-        break
+        while(True):
+            corners, M = random_transform(card, num_cards, output_size=(480, 640))
+            corners_np = np.array(corners, dtype=np.float32)
+            # Step 1: Warp the card's mask into the output canvas space
+            _, warped_card_mask = paste_card(np.zeros_like(canvas), card_rgb, card_mask, M)
 
-    card_rgb = card[:, :, :3]
-    card_mask = (card[:, :, 3] > 0).astype(np.uint8) * 255
+            # Step 2: Check if it fits in bounds
+            if not (0 <= corners_np[:, 0]).all() or not (corners_np[:, 0] < 480).all():
+                continue
+            if not (0 <= corners_np[:, 1]).all() or not (corners_np[:, 1] < 640).all():
+                continue
 
-    corners, M = random_transform(card, output_size=(480, 640))
+            # Step 3: Check for overlap
+            overlap = cv2.bitwise_and(existing_mask, warped_card_mask)
+            if np.any(overlap):
+                continue  # This placement overlaps a previous card
 
-    # 25% chance: Add a slightly larger sleeve using scaled corners
-    if random.random() < 0.25:
-        sleeve_color = tuple(np.random.randint(0, 255, size=3).tolist())
-        sleeve_shape = card_rgb.shape[:2]  # (height, width)
+            # Step 4: Safe to paste
+            break
 
-        sleeve_img = np.full((sleeve_shape[0], sleeve_shape[1], 3), sleeve_color, dtype=np.uint8)
-        sleeve_mask = np.full((sleeve_shape[0], sleeve_shape[1]), 255, dtype=np.uint8)
+        canvas, warped_card_mask = paste_card(canvas, card_rgb, card_mask, M)
+        existing_mask = cv2.bitwise_or(existing_mask, warped_card_mask)
+        # 25% chance: Add a slightly larger sleeve using scaled corners
+        if random.random() < 0.25:
+            sleeve_color = tuple(np.random.randint(0, 255, size=3).tolist())
+            sleeve_shape = card_rgb.shape[:2]  # (height, width)
 
-        # Scale corners outward from the center
+            sleeve_img = np.full((sleeve_shape[0], sleeve_shape[1], 3), sleeve_color, dtype=np.uint8)
+            sleeve_mask = np.full((sleeve_shape[0], sleeve_shape[1]), 255, dtype=np.uint8)
+
+            # Scale corners outward from the center
+            corners_np = np.array(corners, dtype=np.float32)
+            center = np.mean(corners_np, axis=0)
+            enlarged_corners = (corners_np - center) * 1.05 + center
+
+            src_pts = np.array([
+                [0, 0],
+                [sleeve_shape[1], 0],
+                [sleeve_shape[1], sleeve_shape[0]],
+                [0, sleeve_shape[0]]
+            ], dtype=np.float32)
+
+            sleeve_M = cv2.getPerspectiveTransform(src_pts, enlarged_corners)
+
+            canvas, _ = paste_card(canvas, sleeve_img, sleeve_mask, sleeve_M)
+        canvas, single_mask = paste_card(canvas, card_rgb, card_mask, M)
+        mask_canvas = cv2.bitwise_or(mask_canvas, single_mask)
+
+
+        # Add glare
+        if random.random() < 0.25:
+            # Load glare image
+            glare_img = Image.open(os.path.join(EFFECTS_DIR, "Glare/glare1.jpg")).convert("RGBA")
+
+            # Compute bounding box of the card
+            card_corners_np = np.array(corners, dtype=np.float32)
+            min_x = min(card_corners_np[:, 0])
+            max_x = max(card_corners_np[:, 0])
+            min_y = min(card_corners_np[:, 1])
+            max_y = max(card_corners_np[:, 1])
+            
+            card_w = max_x - min_x
+            card_h = max_y - min_y
+
+            # Choose random scale
+            scale = random.uniform(0.5, 0.9)
+            target_w = int(card_w * scale)
+            target_h = int(card_h * scale)
+
+            # Resize glare
+            glare_resized = glare_img.resize((target_w, target_h), resample=Image.Resampling.LANCZOS)
+
+            # Random rotation
+            angle = random.uniform(0, 360)
+            glare_rotated = glare_resized.rotate(angle, expand=True)
+
+            # Convert to OpenCV
+            glare_cv = cv2.cvtColor(np.array(glare_rotated), cv2.COLOR_RGBA2BGRA)
+
+            # Pick a random position inside card bounding box
+            top_left_x = int(min_x + (card_w - glare_cv.shape[1]) * random.uniform(0, 1))
+            top_left_y = int(min_y + (card_h - glare_cv.shape[0]) * random.uniform(0, 1))
+
+            # Create mask and paste using alpha blending
+            overlay = canvas.copy()
+            x1, y1 = top_left_x, top_left_y
+            x2, y2 = x1 + glare_cv.shape[1], y1 + glare_cv.shape[0]
+
+            # Ensure dimensions match
+            if x2 > overlay.shape[1] or y2 > overlay.shape[0] or x1 < 0 or y1 < 0 or x2 <= x1 or y2 <= y1:
+                continue  # skip if glare would go out of bounds
+
+            roi = overlay[y1:y2, x1:x2]
+            alpha = glare_cv[:, :, 3] / 255.0
+            for c in range(3):
+                roi[:, :, c] = roi[:, :, c] * (1 - alpha) + glare_cv[:, :, c] * alpha
+
+            overlay[y1:y2, x1:x2] = roi
+            canvas = overlay
+
+        # Normalize for YOLO: x1, y1, x2, y2, ...
+        height, width = 640, 480
         corners_np = np.array(corners, dtype=np.float32)
-        center = np.mean(corners_np, axis=0)
-        enlarged_corners = (corners_np - center) * 1.05 + center
 
-        src_pts = np.array([
-            [0, 0],
-            [sleeve_shape[1], 0],
-            [sleeve_shape[1], sleeve_shape[0]],
-            [0, sleeve_shape[0]]
-        ], dtype=np.float32)
+        # Flatten and normalize
+        norm_corners = []
+        for a, (b, c) in enumerate(corners_np):
+            x_norm = round(b / width, 6)
+            y_norm = round(c / height, 6)
+            norm_corners.extend([x_norm, y_norm])
 
-        sleeve_M = cv2.getPerspectiveTransform(src_pts, enlarged_corners)
-
-        canvas, _ = paste_card(canvas, sleeve_img, sleeve_mask, sleeve_M)
-    canvas, warped_mask = paste_card(canvas, card_rgb, card_mask, M)
-
-    # Normalize for YOLO: x1, y1, x2, y2, ...
-    height, width = 640, 480
-    flat_corners = np.array(corners).reshape(-1)
-    norm_corners = [str(round(coord / width, 6) if i % 2 == 0 else round(coord / height, 6))
-                    for i, coord in enumerate(flat_corners)]
-    yolo_line = f"0 {' '.join(norm_corners)}\n"
+        # Format as YOLO segmentation line
+        yolo_line = f"0 {' '.join(map(str, norm_corners))}\n"
+        yolo_lines.append(yolo_line)
 
     # Save files for validation data
     base_name = f"synthetic_{i:04d}"
     cv2.imwrite(os.path.join(OUTPUT_DIRS["val"]["images"], f"{base_name}.jpg"), canvas)
-    cv2.imwrite(os.path.join(OUTPUT_DIRS["val"]["masks"], f"{base_name}.png"), warped_mask)
+    cv2.imwrite(os.path.join(OUTPUT_DIRS["val"]["masks"], f"{base_name}.png"), mask_canvas)
     with open(os.path.join(OUTPUT_DIRS["val"]["labels"], f"{base_name}.txt"), "w") as f:
-        f.write(yolo_line)
+        f.writelines(yolo_lines)
 
     if i % 100 == 0:
-        print(f"[VALIDATION] Generated {i-4000} samples...")
+        print(f"[VALIDATION] Generated {i-int(NUM_IMAGES*.8)} samples...")
 
 print("Dataset generation complete!")
