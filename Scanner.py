@@ -2,6 +2,7 @@
 import cv2
 import numpy as np
 from PIL import Image
+from ultralytics import YOLO
 import json
 import datetime
 
@@ -112,12 +113,12 @@ def draw_masks(image, detections):
         draw_mask(image, detection['mask'])
 
 
-def process_masks_to_cards(image, detections, mirror):
+def process_masks_to_cards(image, detections, rotation_model):
     for detection in detections:
         # Skip if match is already found and tracked
         if 'match' in detection:
             continue
-        card_images = perspective_transform(image, detection['mask'], mirror)
+        card_images = perspective_transform(image, detection['mask'], detection['bbox'], rotation_model)
         if card_images is not None:
             #print('not none')
             detection['card_images'] = card_images
@@ -156,7 +157,7 @@ def show_contour(contour, original_image):
     cv2.destroyAllWindows()
 
 
-def perspective_transform(image, mask, mirror):
+def perspective_transform(image, mask, bbox, rotation_model):
     # Convert the boolean mask to uint8
     mask_uint8 = mask.astype(np.uint8) * 255
 
@@ -171,6 +172,9 @@ def perspective_transform(image, mask, mirror):
 
     # Find contours in the mask
     contours, _ = cv2.findContours(mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    # Sort contours by area from largest to smallest
+    contours = sorted(contours, key=cv2.contourArea, reverse=True)
 
     image_with_detections = image.copy()
 
@@ -206,20 +210,17 @@ def perspective_transform(image, mask, mirror):
 
             # Resize the warped image to fill the canvas without maintaining aspect ratio
             warped_stretched = cv2.resize(warped, (250, 350))
-            if mirror is True:
-                warped_stretched = cv2.flip(warped_stretched, 1)
-            
-            if width > height:
-                rot_90  = cv2.rotate(warped, cv2.ROTATE_90_CLOCKWISE)
-                rot_90 = cv2.resize(rot_90, (250, 350))
-                rot_270 = cv2.rotate(warped, cv2.ROTATE_90_COUNTERCLOCKWISE)
-                rot_270 = cv2.resize(rot_270, (250, 350))
-                return warped_stretched
-            # Generate rotated versions: 0°, 90°, 180°, 270°
-            rot_0 = warped
-            rot_0 = cv2.resize(rot_0, (250, 350))
-            rot_180 = cv2.rotate(warped, cv2.ROTATE_180)
-            rot_180 = cv2.resize(rot_180, (250, 350))
+            results = rotation_model.predict(source=Image.fromarray(warped_stretched), verbose=False)
+            predicted_class = int(results[0].probs.top1)
+            if predicted_class == 3:
+                warped_stretched = cv2.rotate(warped_stretched, cv2.ROTATE_90_CLOCKWISE)
+                warped_stretched = cv2.resize(warped_stretched, (250, 350))
+            elif predicted_class == 1:
+                warped_stretched = cv2.rotate(warped_stretched, cv2.ROTATE_90_COUNTERCLOCKWISE)
+                warped_stretched = cv2.resize(warped_stretched, (250, 350))
+            elif predicted_class == 2:
+                warped_stretched = cv2.rotate(warped_stretched, cv2.ROTATE_180)
+                warped_stretched = cv2.resize(warped_stretched, (250, 350))
             return warped_stretched
 
     return None
