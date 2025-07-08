@@ -1,15 +1,21 @@
 import os
+from ultralytics import YOLO
 import cv2
+import torch
+import numpy as np
 import Detector
 import Scanner
 import matplotlib.pyplot as plt
+from PIL import Image
 
 # Settings
-weights = "SegmentationTraining/runs/segment/train6/weights/best.pt"
-image_folder = 'SegmentationTraining/images/val'
-width = 640
+weights = "SegmentationTraining/runs/segment/train17/weights/best_detection.pt"
+rotation_weights = "Rotation/runs/classify/train7/weights/best_rotation.pt"
+rotation_model = YOLO(rotation_weights)
+image_folder = 'SegmentationTraining/images/test'
+width = 480
 height = 640
-scoreThreshold = 0.5
+scoreThreshold = 0.4
 save_image = False
 mirror = False
 include_flipped = True  # currently not used, but left for consistency
@@ -33,7 +39,7 @@ def main():
 
     # Loop through each file in the folder
     for filename in os.listdir(image_folder):
-        if not filename.lower().endswith(('.png', '.jpg', '.jpeg')):
+        if not filename.lower().endswith(('.png', '.jpg', '.jpeg', '.webp', '.avif')):
             continue  # Skip non-image files
 
         image_path = os.path.join(image_folder, filename)
@@ -44,7 +50,7 @@ def main():
 
         detections = detector.detect_objects(image_original, scoreThreshold)
 
-        Scanner.process_masks_to_cards(image_original, detections, mirror)
+        Scanner.process_masks_to_cards(image_original, detections, rotation_model)
         show_each_detection(detections, image_title=filename)
 
         Scanner.draw_boxes(image_copy, detections)
